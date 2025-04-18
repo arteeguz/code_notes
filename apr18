@@ -1,0 +1,405 @@
+1. Add Required Dependencies
+Add these to your pom.xml within the <dependencies> section:
+xml<!-- WMI4Java for connecting to Windows machines -->
+<dependency>
+    <groupId>com.profesorfalken</groupId>
+    <artifactId>WMI4Java</artifactId>
+    <version>1.6.3</version>
+</dependency>
+
+<!-- JCIFS for authentication -->
+<dependency>
+    <groupId>org.codelibs</groupId>
+    <artifactId>jcifs</artifactId>
+    <version>2.1.31</version>
+</dependency>
+2. Create Security Configuration
+Create a new file SecurityConfig.java in src/main/java/com/networkscanner/config:
+javapackage com.networkscanner.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.annotation.web.configuration.EnableWebSecurity;
+import org.springframework.security.core.userdetails.User;
+import org.springframework.security.core.userdetails.UserDetails;
+import org.springframework.security.core.userdetails.UserDetailsService;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
+import org.springframework.security.crypto.password.PasswordEncoder;
+import org.springframework.security.provisioning.InMemoryUserDetailsManager;
+import org.springframework.security.web.SecurityFilterChain;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+    @Bean
+    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+        http
+            .cors().and()
+            .csrf().disable()
+            .authorizeHttpRequests(authorize -> authorize
+                .requestMatchers("/api/**").hasRole("ADMIN")
+                .anyRequest().authenticated()
+            )
+            .httpBasic();
+        
+        return http.build();
+    }
+
+    @Bean
+    public UserDetailsService userDetailsService() {
+        // This is for demo purposes only - in production use a more secure approach
+        UserDetails adminUser = User.builder()
+            .username("admin")
+            .password(passwordEncoder().encode("adminPassword")) // Change this!
+            .roles("ADMIN")
+            .build();
+        
+        return new InMemoryUserDetailsManager(adminUser);
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+
+    @Bean
+    public CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedOrigins(Arrays.asList("http://localhost:3000")); // React dev server
+        configuration.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS"));
+        configuration.setAllowedHeaders(Arrays.asList("*"));
+        configuration.setAllowCredentials(true);
+        
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", configuration);
+        return source;
+    }
+}
+3. Create Scanner Service
+Create a new file WindowsScannerService.java in src/main/java/com/networkscanner/service:
+javapackage com.networkscanner.service;
+
+import com.profesorfalken.wmi4java.WMI4Java;
+import com.profesorfalken.wmi4java.WMIException;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Service
+@Slf4j
+public class WindowsScannerService {
+
+    private final String adminUsername;
+    private final String adminPassword;
+
+    public WindowsScannerService() {
+        // In a production app, these would come from secured configuration
+        this.adminUsername = "admin"; // Domain admin account
+        this.adminPassword = "adminPassword"; // Use secure password management
+    }
+
+    public Map<String, Object> scanMachine(String ipAddress) {
+        Map<String, Object> result = new HashMap<>();
+        result.put("ipAddress", ipAddress);
+
+        try {
+            // Configure WMI with credentials
+            WMI4Java wmi = WMI4Java.builder()
+                .namespace("\\\\\\\\ROOT\\\\CIMV2")
+                .credentials(adminUsername, adminPassword)
+                .host(ipAddress)
+                .build();
+
+            // Get hostname
+            List<String> hostnames = wmi.listClasses("Win32_ComputerSystem");
+            if (!hostnames.isEmpty()) {
+                Map<String, String> hostnameData = wmi.getWMIObject("Win32_ComputerSystem");
+                result.put("hostname", hostnameData.getOrDefault("Name", "Unknown"));
+            }
+
+            // Get RAM size
+            Map<String, String> memoryData = wmi.getWMIObject("Win32_ComputerSystem");
+            String totalMemoryStr = memoryData.getOrDefault("TotalPhysicalMemory", "0");
+            long totalMemoryBytes = Long.parseLong(totalMemoryStr);
+            double totalMemoryGB = totalMemoryBytes / (1024.0 * 1024.0 * 1024.0);
+            result.put("ramSize", String.format("%.2f GB", totalMemoryGB));
+
+            result.put("status", "success");
+        } catch (WMIException e) {
+            log.error("Error scanning machine at IP {}: {}", ipAddress, e.getMessage());
+            result.put("status", "error");
+            result.put("error", e.getMessage());
+        }
+
+        return result;
+    }
+}
+4. Create REST Controller
+Create a new file ScannerController.java in src/main/java/com/networkscanner/controller:
+javapackage com.networkscanner.controller;
+
+import com.networkscanner.service.WindowsScannerService;
+import lombok.RequiredArgsConstructor;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/scanner")
+@RequiredArgsConstructor
+public class ScannerController {
+
+    private final WindowsScannerService scannerService;
+
+    @PostMapping("/scan")
+    public ResponseEntity<Map<String, Object>> scanMachine(@RequestBody Map<String, String> request) {
+        String ipAddress = request.get("ipAddress");
+        
+        if (ipAddress == null || ipAddress.isEmpty()) {
+            return ResponseEntity.badRequest().build();
+        }
+        
+        Map<String, Object> result = scannerService.scanMachine(ipAddress);
+        return ResponseEntity.ok(result);
+    }
+}
+5. Update Application Properties
+Create or update src/main/resources/application.properties:
+properties# Server configuration
+server.port=8080
+
+# Logging
+logging.level.com.networkscanner=DEBUG
+
+# Expose all endpoints
+management.endpoints.web.exposure.include=*
+
+# Security configuration
+spring.security.user.name=admin
+spring.security.user.password=adminPassword
+Implementing the React Frontend
+Now let's create a React frontend to interact with our backend.
+1. Set up React App
+First, create a new React application in a separate directory:
+bashnpx create-react-app network-scanner-ui
+cd network-scanner-ui
+npm install axios bootstrap react-bootstrap
+2. Create ScannerForm Component
+Create a new file src/components/ScannerForm.js:
+jsximport React, { useState } from 'react';
+import { Form, Button, Card, Spinner, Alert } from 'react-bootstrap';
+import axios from 'axios';
+
+const ScannerForm = () => {
+  const [ipAddress, setIpAddress] = useState('');
+  const [scanResults, setScanResults] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    
+    try {
+      // Configure axios with Basic Auth
+      const response = await axios.post(
+        'http://localhost:8080/api/scanner/scan',
+        { ipAddress },
+        {
+          auth: {
+            username: 'admin',
+            password: 'adminPassword'
+          }
+        }
+      );
+      
+      setScanResults(response.data);
+    } catch (err) {
+      console.error('Error scanning:', err);
+      setError('Failed to scan machine. Check console for details.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <Card className="mt-4">
+      <Card.Header as="h5">Network Scanner</Card.Header>
+      <Card.Body>
+        <Form onSubmit={handleSubmit}>
+          <Form.Group className="mb-3">
+            <Form.Label>IP Address</Form.Label>
+            <Form.Control
+              type="text"
+              placeholder="Enter IP address to scan"
+              value={ipAddress}
+              onChange={(e) => setIpAddress(e.target.value)}
+              required
+            />
+          </Form.Group>
+          
+          <Button variant="primary" type="submit" disabled={loading}>
+            {loading ? (
+              <>
+                <Spinner as="span" animation="border" size="sm" role="status" aria-hidden="true" />
+                {' '}Scanning...
+              </>
+            ) : (
+              'Scan Machine'
+            )}
+          </Button>
+        </Form>
+        
+        {error && (
+          <Alert variant="danger" className="mt-3">
+            {error}
+          </Alert>
+        )}
+        
+        {scanResults && !error && (
+          <div className="mt-4">
+            <h5>Scan Results</h5>
+            <table className="table table-bordered">
+              <thead>
+                <tr>
+                  <th>Property</th>
+                  <th>Value</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>IP Address</td>
+                  <td>{scanResults.ipAddress}</td>
+                </tr>
+                <tr>
+                  <td>Hostname</td>
+                  <td>{scanResults.hostname}</td>
+                </tr>
+                <tr>
+                  <td>RAM Size</td>
+                  <td>{scanResults.ramSize}</td>
+                </tr>
+                <tr>
+                  <td>Status</td>
+                  <td>{scanResults.status}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Card.Body>
+    </Card>
+  );
+};
+
+export default ScannerForm;
+3. Update App.js
+Update the file src/App.js:
+jsximport React from 'react';
+import { Container, Row, Col, Navbar } from 'react-bootstrap';
+import ScannerForm from './components/ScannerForm';
+import 'bootstrap/dist/css/bootstrap.min.css';
+
+function App() {
+  return (
+    <div className="App">
+      <Navbar bg="dark" variant="dark">
+        <Container>
+          <Navbar.Brand>Network Scanner</Navbar.Brand>
+        </Container>
+      </Navbar>
+      
+      <Container>
+        <Row className="justify-content-md-center">
+          <Col md={8}>
+            <ScannerForm />
+          </Col>
+        </Row>
+      </Container>
+    </div>
+  );
+}
+
+export default App;
+Running the Application
+Here's a step-by-step guide to run your application:
+Backend Setup and Run
+
+Extract the ZIP from Spring Initializr
+Add the dependencies to pom.xml
+Create the Java files as shown above
+Run the application with:
+bashcd network-scanner
+mvn spring-boot:run
+
+
+Frontend Setup and Run
+
+Navigate to the React app directory
+Install dependencies
+Start the development server:
+bashcd network-scanner-ui
+npm start
+
+
+The React app will be available at http://localhost:3000
+Environment Setup Checklist
+Before running the application, make sure you have:
+
+Java Development Environment:
+
+ Java 17 JDK installed
+ JAVA_HOME environment variable set
+
+
+Maven:
+
+ Maven installed (3.8.x or newer)
+ Maven in PATH
+
+
+Node.js and npm:
+
+ Node.js installed (14.x or newer)
+ npm in PATH
+
+
+Network configuration:
+
+ Firewall allows WMI connections (ports 135, 445)
+ Admin credentials for target machines
+
+
+Web browser:
+
+ Modern web browser for accessing React UI
+
+
+
+Notes and Next Steps
+This implementation provides:
+
+A basic Spring Boot REST API to scan Windows machines
+A React frontend to input IP addresses and view results
+Basic authentication using Spring Security
+
+For the next iteration, you can:
+
+Add more data collection fields from the requirements
+Implement database storage with MongoDB
+Add scan history and multi-machine scanning
+Enhance security with proper credential storage
+Improve the UI with more features and better styling
+
